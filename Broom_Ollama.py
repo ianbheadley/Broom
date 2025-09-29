@@ -5,9 +5,8 @@ import argparse
 import json
 import shutil
 from typing import Dict, List, Any
-import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import ollama
-from tqdm.asyncio import tqdm as async_tqdm
 from tqdm import tqdm
 
 class OllamaClient:
@@ -36,18 +35,17 @@ class OllamaClient:
             print(f"\n❌ Error: Could not connect to Ollama. Is the application running?\n   (Details: {e})")
             return False
 
-    async def get_plan_async(self, prompt: str, batch_num: int) -> dict:
+    def get_file_batch_plan_sync(self, prompt: str, batch_num: int) -> dict:
         """
-        Asynchronously gets an organization plan from the Ollama model.
+        Synchronously gets an organization plan for a file batch from the Ollama model.
         Args:
             prompt (str): The prompt to send to the model.
             batch_num (int): The batch number for logging purposes.
         Returns:
-            dict: The JSON response from the model.
+            dict: The raw JSON response from the model.
         """
         try:
-            response = await asyncio.to_thread(
-                ollama.chat,
+            response = ollama.chat(
                 model=self.model,
                 messages=[{'role': 'user', 'content': prompt}],
                 options={'temperature': 0.0},
@@ -134,15 +132,23 @@ class FileOrganizer:
 
                 relative_path = os.path.relpath(filepath, self.directory)
                 file_ext = os.path.splitext(filename)[1].lower()
-                content = ""
-                if file_ext in self.text_extensions:
-                    try:
-                        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-                            content = f.read(self.max_content_length)
-                    except Exception:
-                        content = "<Unreadable>"
-                else:
-                    content = "Binary file."
+
+                # Improved file type detection: try to read all files as text by default,
+                # and only classify as binary if it contains null bytes or is unreadable.
+                try:
+                    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                        content_sample = f.read(self.max_content_length)
+
+                    # Heuristic: If a file contains a null byte, it's likely binary.
+                    # We make an exception for known text types that might contain them.
+                    if '\x00' in content_sample and file_ext not in self.text_extensions:
+                        content = "Binary file."
+                    else:
+                        content = content_sample if content_sample else "<Empty file>"
+                except (IOError, OSError):
+                    content = "Binary file." # Can't be opened in text mode.
+                except Exception:
+                    content = "<Unreadable>" # Other unexpected errors.
 
                 files_index.append({"path": relative_path, "file_type": file_ext, "content_summary": content})
 
@@ -153,37 +159,62 @@ class FileOrganizer:
         print(f"✅ Indexed {len(files_index)} files.")
         return files_index
 
-    async def organize(self, dry_run: bool, skip_confirmation: bool):
+    def organize(self, dry_run: bool, skip_confirmation: bool, stream: bool = False):
         """
         Runs the file organization process.
         Args:
             dry_run (bool): If True, shows the plan without moving anything.
             skip_confirmation (bool): If True, skips the confirmation prompt.
+            stream (bool): If True, streams the AI response in real-time.
         """
         file_index = self.index()
         if not file_index:
             sys.exit("No files found to organize.")
 
         batches = [file_index[i:i + self.batch_size] for i in range(0, len(file_index), self.batch_size)]
-        print(f"\n➡️  Step 2: Analyzing files in {len(batches)} batches concurrently...")
-
-        tasks = []
-        for i, batch in enumerate(batches):
-            file_data_str = json.dumps(batch)
-            prompt = f"Task: Categorize files based on path, file_type, and content. Output ONLY JSON with one key 'organization_plan'. Data: {file_data_str}"
-            tasks.append(self.ollama_client.get_plan_async(prompt, i + 1))
-
         final_plan = {}
-        results = await async_tqdm.gather(*tasks, desc="Processing Batches")
-        for response in results:
-            content = response.get('message', {}).get('content', '{}')
-            try:
-                partial_plan = json.loads(content).get("organization_plan", {})
-                for category, files in partial_plan.items():
-                    final_plan.setdefault(category, []).extend([f for f in files if f not in final_plan.get(category, [])])
-            except json.JSONDecodeError:
-                print(f"⚠️ Warning: Could not decode AI response: {content}")
 
+        if stream:
+            print(f"\n➡️  Step 2: Analyzing files in {len(batches)} batches sequentially (streaming)...")
+            for i, batch in enumerate(tqdm(batches, desc="Processing Batches")):
+                file_data_str = json.dumps(batch)
+                prompt = f"Task: Categorize files based on path, file_type, and content. Output ONLY JSON with one key 'organization_plan'. Data: {file_data_str}"
+
+                print(f"\n--- Batch {i+1}/{len(batches)} ---")
+                full_response_content = ""
+                for chunk in self.ollama_client.get_plan_stream(prompt):
+                    print(chunk, end='', flush=True)
+                    full_response_content += chunk
+                print("\n")
+
+                try:
+                    response_data = json.loads(full_response_content)
+                    partial_plan = response_data.get("organization_plan", {})
+                    for category, files in partial_plan.items():
+                        final_plan.setdefault(category, []).extend([f for f in files if f not in final_plan.get(category, [])])
+                except json.JSONDecodeError:
+                    print(f"\n⚠️ Warning: Could not decode AI response for batch {i+1}")
+
+        else:
+            print(f"\n➡️  Step 2: Analyzing files in {len(batches)} batches concurrently...")
+            with ThreadPoolExecutor() as executor:
+                futures = []
+                for i, batch in enumerate(batches):
+                    file_data_str = json.dumps(batch)
+                    prompt = f"Task: Categorize files based on path, file_type, and content. Output ONLY JSON with one key 'organization_plan'. Data: {file_data_str}"
+                    futures.append(executor.submit(self.ollama_client.get_file_batch_plan_sync, prompt, i + 1))
+
+                results = [future.result() for future in tqdm(futures, desc="Processing Batches")]
+
+            for response in results:
+                if response:
+                    content = response.get('message', {}).get('content', '{}')
+                    try:
+                        partial_plan = json.loads(content).get("organization_plan", {})
+                        for category, files in partial_plan.items():
+                            final_plan.setdefault(category, []).extend([f for f in files if f not in final_plan.get(category, [])])
+                    except json.JSONDecodeError:
+                        print(f"⚠️ Warning: Could not decode AI response: {content}")
 
         Broom.display_plan(final_plan, "files", self.recursive)
         if not dry_run and (skip_confirmation or input("Apply this plan? (y/N): ").lower().strip() == 'y'):
@@ -457,11 +488,15 @@ class Broom:
                 print(f"\n👉 {len(standalone)} folders will be left as they are.")
         print("─" * 40)
 
-    async def run(self):
+    def run(self):
         """
         Runs the main application logic.
         """
         args = self.parser.parse_args()
+
+        # In files mode, streaming is not concurrent. Warn the user if they try both.
+        if args.mode == 'files' and args.stream:
+            print("⚠️  Warning: Streaming for files is sequential and does not run concurrently.")
 
         if not any(arg in ['--undo', '-h', '--help'] for arg in sys.argv):
             ollama_client = OllamaClient(self.config['OLLAMA_MODEL'])
@@ -493,7 +528,7 @@ class Broom:
                 text_extensions=self.config['TEXT_EXTENSIONS'],
                 max_content_length=self.config['MAX_CONTENT_LENGTH']
             )
-            await organizer.organize(args.dry_run, args.yes)
+            organizer.organize(args.dry_run, args.yes, args.stream)
         else:
             if args.recursive:
                 print("⚠️  Warning: Recursive mode is only supported for file organization. Running on top-level folders only.")
@@ -506,4 +541,4 @@ class Broom:
 
 if __name__ == "__main__":
     broom = Broom()
-    asyncio.run(broom.run())
+    broom.run()
