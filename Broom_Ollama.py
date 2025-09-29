@@ -78,6 +78,27 @@ class OllamaClient:
             print(f"\n❌ An AI communication error occurred: {e}")
             return None
 
+    def get_plan_stream(self, prompt: str):
+        """
+        Gets an organization plan from the Ollama model, streaming the response.
+        Args:
+            prompt (str): The prompt to send to the model.
+        Yields:
+            str: The content chunks of the JSON response.
+        """
+        try:
+            response_stream = ollama.chat(
+                model=self.model,
+                messages=[{'role': 'user', 'content': prompt}],
+                options={'temperature': 0.0},
+                format='json',
+                stream=True
+            )
+            for chunk in response_stream:
+                yield chunk['message']['content']
+        except Exception as e:
+            print(f"\n❌ An AI communication error occurred during streaming: {e}")
+
 
 class FileOrganizer:
     """
@@ -224,12 +245,13 @@ class FolderOrganizer:
         print(f"✅ Indexed {len(folder_index)} folders.")
         return folder_index
 
-    def organize(self, dry_run: bool, skip_confirmation: bool):
+    def organize(self, dry_run: bool, skip_confirmation: bool, stream: bool = False):
         """
         Runs the folder organization process.
         Args:
             dry_run (bool): If True, shows the plan without moving anything.
             skip_confirmation (bool): If True, skips the confirmation prompt.
+            stream (bool): If True, streams the AI response in real-time.
         """
         folder_index = self.index()
         if not folder_index:
@@ -237,14 +259,46 @@ class FolderOrganizer:
 
         print("\n➡️  Step 2: Analyzing folder structure...")
         folder_data_str = json.dumps(folder_index)
-        prompt = f"Task: Group folders. Rules: Group MUST contain >= 2 folders. Ungroupable folders go into '_standalone'. Output ONLY JSON with 'organization_plan' key. Data: {folder_data_str}"
+        prompt = (f"Task: Group folders into parent categories. Rules: "
+                  f"1. A group MUST contain 2 or more folders. "
+                  f"2. A parent category's name MUST NOT be the same as any of the folders inside it. "
+                  f"3. Ungroupable folders go into a special category named '_standalone'. "
+                  f"4. Output ONLY JSON with a single key 'organization_plan'. Data: {folder_data_str}")
+
         print("   - Asking AI for a folder organization plan...")
-        response_data = self.ollama_client.get_plan_sync(prompt)
+
+        if stream:
+            print("   - Streaming AI response... (raw JSON will be printed below)")
+            full_response_content = ""
+            for chunk in self.ollama_client.get_plan_stream(prompt):
+                print(chunk, end='', flush=True)
+                full_response_content += chunk
+            print("\n") # Newline after stream finishes
+            try:
+                response_data = json.loads(full_response_content)
+            except json.JSONDecodeError:
+                sys.exit("\n❌ Could not decode the streamed JSON response from the AI.")
+        else:
+            response_data = self.ollama_client.get_plan_sync(prompt)
 
         if not response_data or "organization_plan" not in response_data:
             sys.exit("❌ Could not get a valid organization plan from the AI.")
 
-        final_plan = response_data["organization_plan"]
+        raw_plan = response_data.get("organization_plan", {})
+        final_plan = {}
+        standalone_folders = raw_plan.get('_standalone', [])
+        groups_to_process = {k: v for k, v in raw_plan.items() if k != '_standalone'}
+
+        for parent, children in groups_to_process.items():
+            valid_children = [child for child in children if child != parent]
+            if len(valid_children) >= 2:
+                final_plan[parent] = valid_children
+            else:
+                standalone_folders.extend(valid_children)
+
+        if standalone_folders:
+            final_plan['_standalone'] = sorted(list(set(standalone_folders)))
+
         Broom.display_plan(final_plan, "folders")
         if not dry_run and (skip_confirmation or input("Apply this plan? (y/N): ").lower().strip() == 'y'):
             self.execute_plan(final_plan)
@@ -371,6 +425,7 @@ class Broom:
         parser.add_argument("--undo", action="store_true", help="Undo the last organization in the specified directory.")
         parser.add_argument("--dry-run", action="store_true", help="Show the plan without moving anything.")
         parser.add_argument("-y", "--yes", action="store_true", help="Skip confirmation and execute the plan.")
+        parser.add_argument("--stream", action="store_true", help="Stream the AI's response in real-time (folders mode only).")
         return parser
 
     @staticmethod
@@ -446,7 +501,7 @@ class Broom:
                 directory=target_directory,
                 ollama_client=ollama_client
             )
-            organizer.organize(args.dry_run, args.yes)
+            organizer.organize(args.dry_run, args.yes, args.stream)
 
 
 if __name__ == "__main__":
