@@ -7,10 +7,13 @@ import queue
 import os
 from AppKit import NSOpenPanel, NSFileHandlingPanelOKButton
 import json
+import base64
+import tempfile
 
 class BroomApp(rumps.App):
     def __init__(self):
-        super(BroomApp, self).__init__(config.APP_TITLE, icon=config.APP_ICON)
+        icon_path = self.setup_icon()
+        super(BroomApp, self).__init__(config.APP_TITLE, icon=icon_path)
         self.ollama_client = OllamaClient(config.OLLAMA_MODEL)
         self.menu = [
             'Organize Files',
@@ -27,6 +30,23 @@ class BroomApp(rumps.App):
         self.current_directory = None
         self.current_plan = None
         self.current_mode = None
+
+    def setup_icon(self):
+        """Decodes the icon and saves it to a temporary file."""
+        try:
+            icon_data = base64.b64decode(config.APP_ICON)
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as fp:
+                fp.write(icon_data)
+                self.icon_path = fp.name
+            return self.icon_path
+        except Exception as e:
+            print(f"Error setting up icon: {e}")
+            return None
+
+    def cleanup(self):
+        """Remove the temporary icon file on exit."""
+        if hasattr(self, 'icon_path') and os.path.exists(self.icon_path):
+            os.remove(self.icon_path)
 
     def process_queue(self, _):
         """Process messages from the background thread."""
@@ -255,4 +275,8 @@ class BroomApp(rumps.App):
                 thread.start()
 
 if __name__ == "__main__":
-    BroomApp().run()
+    app = BroomApp()
+    try:
+        app.run()
+    finally:
+        app.cleanup()
